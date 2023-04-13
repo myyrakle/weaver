@@ -53,7 +53,7 @@ type weavelet struct {
 	env       env                  // Manages interactions with execution environment
 	info      *protos.EnvelopeInfo // Setup info sent by the deployer.
 	transport *transport           // Transport for cross-weavelet communication
-	dialAddr  call.NetworkAddress  // Address this weavelet is reachable at
+	dialAddr  string               // Address this weavelet is reachable at
 	tracer    trace.Tracer         // Tracer for this weavelet
 
 	root             *component                  // The automatically created "root" component
@@ -135,8 +135,9 @@ func newWeavelet(ctx context.Context, componentInfos []*codegen.Registration) (*
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String(fmt.Sprintf("serviceweaver/%s", info.Id)),
 			semconv.ProcessPIDKey.Int(os.Getpid()),
-			traceio.AppNameTraceKey.String(info.App),
-			traceio.VersionTraceKey.String(info.DeploymentId),
+			traceio.AppTraceKey.String(info.App),
+			traceio.DeploymentIdTraceKey.String(info.DeploymentId),
+			traceio.WeaveletIdTraceKey.String(info.Id),
 		)),
 		// TODO(spetrovic): Allow the user to create new TracerProviders where
 		// they can control trace sampling and other options.
@@ -225,7 +226,7 @@ func (w *weavelet) start() (Instance, error) {
 		startWork(w.ctx, "serve weavelet conn", remote.conn.Serve)
 
 		lis := remote.conn.Listener()
-		addr := call.NetworkAddress(fmt.Sprintf("tcp://%s", lis.Addr().String()))
+		addr := fmt.Sprintf("tcp://%s", lis.Addr().String())
 		w.dialAddr = addr
 		for _, c := range w.componentsByName {
 			if c.info.Routed {
@@ -234,24 +235,9 @@ func (w *weavelet) start() (Instance, error) {
 			}
 		}
 
-		// Start serving the transport.
-		serve := func(lis net.Listener, transport *transport) {
-			if lis == nil || transport == nil {
-				// TODO(spetrovic): Can this ever happen?
-				return
-			}
-
-			// Arrange to close the listener when we are canceled.
-			go func() {
-				<-w.ctx.Done()
-				lis.Close()
-			}()
-
-			startWork(w.ctx, "handle calls", func() error {
-				return call.Serve(w.ctx, lis, handlers, transport.serverOpts)
-			})
-		}
-		serve(lis, w.transport)
+		startWork(w.ctx, "handle calls", func() error {
+			return call.Serve(w.ctx, lis, handlers, w.transport.serverOpts)
+		})
 	}
 
 	w.logRolodexCard()
@@ -301,7 +287,7 @@ func (w *weavelet) logRolodexCard() {
 	lines := []string{
 		fmt.Sprintf("   hostname   : %s ", hostname),
 		fmt.Sprintf("   deployment : %s ", w.info.DeploymentId),
-		fmt.Sprintf("   address    : %s", string(w.dialAddr)),
+		fmt.Sprintf("   address    : %s", w.dialAddr),
 		fmt.Sprintf("   pid        : %v ", os.Getpid()),
 	}
 

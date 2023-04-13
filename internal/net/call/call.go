@@ -128,7 +128,6 @@ type reconnectingConnection struct {
 	connections map[string]*clientConnection // keys are endpoint addresses
 	draining    map[string]*clientConnection // keys are endpoint addresses
 	closed      bool
-	balancer    Balancer
 
 	resolver       Resolver
 	cancelResolver func()         // cancels the watchResolver goroutine
@@ -188,19 +187,47 @@ type serverState struct {
 
 // Serve starts listening for connections and requests on l. Handlers to handle
 // incoming requests are found in hmap.
+//
+// Serve always returns a non-nil error and closes l.
 func Serve(ctx context.Context, l net.Listener, hmap *HandlerMap, opts ServerOptions) error {
 	opts = opts.withDefaults()
 	ss := &serverState{opts: opts}
 	defer ss.stop()
 
-	for ctx.Err() == nil {
+	l = &onceCloseListener{Listener: l}
+
+	// Arrange to close the listener when the context is canceled.
+	go func() {
+		<-ctx.Done()
+		l.Close()
+	}()
+
+	for {
 		conn, err := l.Accept()
-		if err != nil {
+		switch {
+		case ctx.Err() != nil:
+			return ctx.Err()
+		case err != nil:
+			l.Close()
 			return fmt.Errorf("call server error listening on %s: %w", l.Addr(), err)
 		}
 		ss.serveConnection(ctx, conn, hmap)
 	}
-	return ctx.Err()
+}
+
+// onceCloseListener wraps a net.Listener, protecting it from multiple Close calls.
+// TODO: replace with sync.OnceValues which should be available in go1.21
+type onceCloseListener struct {
+	net.Listener
+	once     sync.Once
+	closeErr error
+}
+
+func (oc *onceCloseListener) Close() error {
+	oc.once.Do(func() {
+		oc.closeErr = oc.Listener.Close()
+	})
+	return oc.closeErr
 }
 
 // ServeOn serves client requests received over an already established
@@ -250,18 +277,12 @@ func (ss *serverState) unregister(c *serverConnection) {
 // Connect creates a connection to the servers at the endpoints returned by the
 // resolver.
 func Connect(ctx context.Context, resolver Resolver, opts ClientOptions) (Connection, error) {
-	// Fill in default options.
-	if opts.Balancer == nil {
-		opts.Balancer = RoundRobin()
-	}
-
 	// Construct the connection.
 	conn := reconnectingConnection{
 		opts:           opts.withDefaults(),
 		endpoints:      []Endpoint{},
 		connections:    map[string]*clientConnection{},
 		draining:       map[string]*clientConnection{},
-		balancer:       opts.Balancer,
 		resolver:       resolver,
 		cancelResolver: func() {},
 	}
@@ -466,7 +487,7 @@ func (rc *reconnectingConnection) updateEndpoints(endpoints []Endpoint) error {
 		rc.draining[addr] = conn
 	}
 	rc.connections = connections
-	rc.balancer.Update(endpoints)
+	rc.opts.Balancer.Update(endpoints)
 
 	// Close draining connections that don't have any pending requests. If a
 	// draining connection does have pending requests, then the connection will
@@ -509,7 +530,7 @@ func (rc *reconnectingConnection) startCall(ctx context.Context, rpc *call, opts
 	// important that we index into rc.connections with addr while still
 	// holding rc.mu. Otherwise, a Pick() call could operate on a stale set of
 	// endpoints and return an endpoint that does not exist in rc.connections.
-	var balancer = rc.balancer
+	var balancer = rc.opts.Balancer
 	if opts.Balancer != nil {
 		balancer = opts.Balancer
 		balancer.Update(rc.endpoints)
@@ -843,7 +864,6 @@ func logError(logger *slog.Logger, details string, err error) {
 	if errors.Is(err, context.Canceled) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, io.ErrClosedPipe) ||
 		errors.Is(err, io.ErrClosedPipe) {
 		logger.Info(details, "err", err)
 	} else {

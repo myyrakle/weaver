@@ -35,7 +35,7 @@ section for a tutorial on how to write Service Weaver applications.
 
 # Installation
 
-Ensure you have [Go installed][go_install], version 1.19 or higher. Then, run
+Ensure you have [Go installed][go_install], version 1.20 or higher. Then, run
 the following to install the `weaver` command:
 
 ```console
@@ -695,26 +695,28 @@ Noting the points above:
     another client's `Put`. For this example, this means that the `Cache` has
     [weak consistency][weak_consistency].
 
-Method calls are executed with at-most-once semantics. This means that Service Weaver
-does not automatically retry method calls that fail. However, you can detect and
-retry failed method calls explicitly using `weaver.ErrRetriable`. If a method
-call fails because of a transient system error (e.g., a component replica
-crashed, the network is partitioned), it returns an error with an embedded
-`weaver.ErrRetriable`. This allows you to retry failed method calls like this:
+If a remote method call fails to execute properly&mdash;because of a machine
+crash or a network partition, for example&mdash;it returns an error with an
+embedded `weaver.RemoteCallError`. Here's an illustrative example:
 
 ```go
-// Retry the cache.Get method call up to five times.
-var val string
-var err error
-for i := 0; i < 5; i++ {
-    val, err = cache.Get(ctx, "key")
-    if errors.Is(err, weaver.ErrRetriable) {
-        // Retriable system error! Retry.
-        continue
-    }
-    break
+// Call the cache.Get method.
+value, err := cache.Get(ctx, "key")
+if errors.Is(err, weaver.RemoteCallError) {
+    // cache.Get did not execute properly.
+} else if err != nil {
+    // cache.Get executed properly, but returned an error.
+} else {
+    // cache.Get executed properly and did not return an error.
 }
 ```
+
+Note that if a method call returns an error with an embedded
+`weaver.RemoteCallError`, it does *not* mean that the method never executed. The
+method may have executed partially or fully. Thus, you must be careful retrying
+method calls that result in a `weaver.RemoteCallError`. Ensuring that all
+methods are either read-only or idempotent is one way to ensure safe retries,
+for example. Service Weaver does not automatically retry method calls that fail.
 
 ## Lifetime
 
@@ -924,15 +926,15 @@ Here's an example of how to add metrics to a simple `Adder` component.
 
 ```go
 var (
-    addCount = weaver.NewCounter(
+    addCount = metrics.NewCounter(
         "add_count",
         "The number of times Adder.Add has been called",
     )
-    addConcurrent = weaver.NewGauge(
+    addConcurrent = metrics.NewGauge(
         "add_concurrent",
         "The number of concurrent Adder.Add calls",
     )
-    addSum = weaver.NewHistogram(
+    addSum = metrics.NewHistogram(
         "add_sum",
         "The sums returned by Adder.Add",
         []float64{1, 10, 100, 1000, 10000},
@@ -972,7 +974,7 @@ type halveLabels struct {
 }
 
 var (
-    halveCounts = weaver.NewCounterMap[halveLabels](
+    halveCounts = metrics.NewCounterMap[halveLabels](
         "halve_count",
         "The number of values that have been halved",
     )
@@ -1857,11 +1859,6 @@ to it. Go to [this page][gcloud_billing] to create a new billing account, and
 [this page][gcloud_billing_projects] to associate a billing account with your
 cloud project.
 
-<div hidden class="todo">
-TODO(mwhittaker): Explain how to set up a `/healthz` endpoint once we
-finalize that design.
-</div>
-
 ## Getting Started
 
 Consider again the "Hello, World!" Service Weaver application from the [Step by
@@ -1889,6 +1886,60 @@ The `[gke]` section configures the regions where the application is deployed
 By default, all listeners are **private**, i.e., accessible only from the cloud
 project's internal network. In our example, we declare that the `hello` listener
 is public.
+
+All listeners deployed to GKE are configured to be health-checked by GKE
+load-balancers on the `/healthz` HTTP path. To make the `hello` application
+compatible with these health checks, augment the application code to have
+the HTTP server return status `200` on the `/healthz` endpoint:
+
+```
+package main
+
+import (
+    "context"
+    "fmt"
+    "log"
+    "net/http"
+
+    "github.com/ServiceWeaver/weaver"
+)
+
+func main() {
+    // Initialize the Service Weaver application.
+    root := weaver.Init(context.Background())
+
+    // Get a client to the Reverser component.
+    reverser, err := weaver.Get[Reverser](root)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Get a network listener on address "localhost:12345".
+    opts := weaver.ListenerOptions{LocalAddress: "localhost:12345"}
+    lis, err := root.Listener("hello", opts)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Printf("hello listener available on %v\n", lis)
+
+    // Serve the /hello endpoint.
+    http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+        reversed, err := reverser.Reverse(r.Context(), r.URL.Query().Get("name"))
+        if err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        fmt.Fprintf(w, "Hello, %s!\n", reversed)
+    })
+
+    // Serve Health Check endpoint.
+    http.HandleFunc("/healthz", func(writer http.ResponseWriter, request *http.Request) {
+        fmt.Fprintf(writer, "OK")
+    })
+
+    http.Serve(lis, nil)
+}
+```
 
 Deploy the application using `weaver gke deploy`:
 
@@ -2681,9 +2732,9 @@ overly burdensome, you can explicitly place relevant components in the same
 [colocation group](#config-files), ensuring that they always run in the same OS
 process.
 
-**Note**: Service Weaver guarantees that all network errors are surfaced to the
-application code as `weaver.ErrRetriable`, which can be handled as described in
-an [earlier section](#components-semantics).
+**Note**: Service Weaver guarantees that all system errors are surfaced to the
+application code as `weaver.RemoteCallError`, which can be handled as described
+in an [earlier section](#components-semantics).
 
 ### What types of distributed applications does Service Weaver target?
 
